@@ -117,10 +117,10 @@ class SensorFactory:
                 return HeliCam(configuration)
             if sensor_type == "DAQ":
                 return DAQ(configuration)
-            if sensor_type == "MockCam":
-                return MockCam(configuration)
             if sensor_type == "KinetixCam":
                 return KinetixCam(configuration)
+            if sensor_type == "MockCam":
+                return MockCam(configuration)
             raise ValueError(f"Requested sensor type {sensor_type} does not exists")
         except Exception as exc:
             logging.exception(
@@ -1104,7 +1104,93 @@ class DAQ(Sensor):
         self.daq_task.close()
         logging.info("DAQ closed".ljust(65, "."))
 
+class KinetixCam(Sensor):
+    """
+    Kinetix-based camera class for handling initialization, configuration, 
+    and capturing frames from the camera.
+    """
 
+    def __init__(self, configuration: Dict[str, Any]) -> None:
+        # Import Kinetix dependencies locally to avoid affecting the rest of the code.
+        import cv2
+        from pyvcam import pvc
+        from pyvcam.camera import Camera
+        import numpy as np
+
+        super().__init__(configuration)
+        self.exposure_time = configuration.get("exposure_time", 100)
+        self.roi = configuration.get("roi", [690, 1821, 223, 182])
+        self.cam = None
+        self.attribute_map["exposure_time"] = self._set_exposure_time
+        self.attribute_map["roi"] = self._set_roi
+        self.pvc = pvc
+        self.Camera = Camera
+
+    def _set_exposure_time(self, exposure_time: int) -> None:
+        """Sets the exposure time for the camera."""
+        self.exposure_time = exposure_time
+
+    def _set_roi(self, roi: List[int]) -> None:
+        """Sets the region of interest (ROI) for the camera."""
+        self.roi = roi
+
+    def open(self) -> None:
+        """Initialize PVCAM and open the camera."""
+        print("Initializing PVCAM library and Kinetix camera...")
+        self.pvc.init_pvcam()
+        self.cam = next(self.Camera.detect_camera())
+        self.cam.open()
+        print("Kinetix camera initialized successfully.")
+
+    def configure_camera(self) -> None:
+        """Set the ROI and exposure time for the camera."""
+        if self.cam:
+            self.cam.roi = [self.roi]
+            self.cam.exp_time = self.exposure_time
+            print("Camera configuration complete.")
+
+    def acquire_data(self, synchroniser: Optional[Synchroniser] = None) -> np.ndarray:
+        """Capture a single frame and return it as a numpy array."""
+        if synchroniser:
+            synchroniser.trigger()
+
+        print("Starting live mode and capturing a single frame...")
+        self.cam.start_live()
+        frame = self.cam.get_frame()
+        self.cam.finish()
+
+        if frame is None:
+            raise ValueError("No frame captured.")
+
+        # Process the frame for saving/viewing
+        print("Processing captured frame...")
+        frame = self._process_frame(frame)
+        return frame
+
+    def _process_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Process frame for display or saving."""
+        print("Processing and saving the frame...")
+
+        # Normalization for visualization, if needed
+        if frame.max() > 255 or frame.min() < 0:
+            frame = ((frame - frame.min()) / (frame.max() - frame.min()) * 255).astype(np.uint8)
+        else:
+            frame = frame.astype(np.uint8)
+
+        return frame
+
+    def save_frame(self, frame: np.ndarray, filename="snapshot_1.png") -> None:
+        """Save the processed frame as an image file."""
+        cv2.imwrite(filename, frame)
+        print(f"Snapshot saved as {filename}")
+
+    def close(self) -> None:
+        """Close the camera and uninitialize PVCAM."""
+        if self.cam:
+            self.cam.close()
+            self.pvc.uninit_pvcam()
+        print("Kinetix camera shutdown complete.")
+        
 class MockCam(Sensor):
     """
     To ensure users can test their code and the general logic without having
@@ -1175,100 +1261,5 @@ class MockCam(Sensor):
         """
         Passes since there is no device to close.
         """
-class KinetixCam(Sensor):
-    """
-    Sensor class for Kinetix camera.
 
-    Arguments:
-        - **configuration** (dict): Configuration dictionary with settings like
-          `exposure_time`, `image_roi`, `frames_per_trigger`, `trigger_mode`, `snapshot`.
-    """
-
-    def __init__(self, configuration: Dict[str, Any]) -> None:
-        self.cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-        self.cam.Open()
-        super().__init__(configuration)
-        
-        # Map configuration attributes
-        self.attribute_map["exposure_time"] = self._set_exposure_time
-        self.attribute_map["image_roi"] = self._set_roi
-        self.attribute_map["frames_per_trigger"] = self._set_frames_per_trigger
-        self.attribute_map["trigger_mode"] = self._set_trigger_mode
-        self.initial_configuration_dict = configuration
-        self.roi_shape = [3200, 3200]  # Example ROI dimensions; update based on config
-        
-        # Apply configurations
-        if configuration:
-            self._update_from_configuration(configuration)
-
-    def __repr__(self) -> str:
-        return f"KinetixCam(configuration: {self.initial_configuration_dict})"
-
-    def __str__(self) -> str:
-        return f"Kinetix camera instance: KinetixCam(configuration: {self.initial_configuration_dict})"
-
-    def _set_exposure_time(self, exposure_time: int) -> None:
-        """Set camera exposure time (in ms)."""
-        self.cam.ExposureTime.SetValue(exposure_time * 1000)  # Convert ms to µs if needed
-
-    def _set_roi(self, roi: List[int]) -> None:
-        """Set Region of Interest (ROI) on the camera sensor."""
-        x, y, width, height = roi
-        self.cam.OffsetX.SetValue(x)
-        self.cam.OffsetY.SetValue(y)
-        self.cam.Width.SetValue(width)
-        self.cam.Height.SetValue(height)
-        self.roi_shape = [height, width]
-
-    def _set_frames_per_trigger(self, frames: int) -> None:
-        """Set the number of frames per trigger."""
-        self.cam.AcquisitionFrameCount.SetValue(frames)
-
-    def _set_trigger_mode(self, mode: str) -> None:
-        """Set the camera's trigger mode."""
-        self.cam.TriggerMode.SetValue(mode)
-
-    def acquire_data(self, synchroniser: Optional[Synchroniser] = None) -> np.ndarray:
-        """Acquire frames from the Kinetix camera."""
-        time_start = time()
-        self.cam.StartGrabbingMax(self.number_measurements)
-        if synchroniser:
-            synchroniser.trigger()
-        
-        frames = []
-        for _ in range(self.number_measurements):
-            grab_result = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-            if grab_result.GrabSucceeded():
-                frame = np.asarray(grab_result.Array)
-                frames.append(frame)
-                if self.initial_configuration_dict.get("snapshot"):
-                    self._save_snapshot(frame)
-            grab_result.Release()
-        
-        time_end = time()
-        logging.info(f"Kinetix data acquisition took {time_end - time_start:.2f} seconds".ljust(65, ".") + "[done]")
-        return np.array(frames)
-
-    def _save_snapshot(self, frame: np.ndarray) -> None:
-        """Save a snapshot of the frame if snapshot is enabled."""
-        import cv2
-        timestamp = int(time())
-        filename = f"kinetix_snapshot_{timestamp}.png"
-        cv2.imwrite(filename, frame)
-        logging.info(f"Snapshot saved as {filename}")
-
-    def open(self) -> None:
-        """Opens camera connection."""
-        logging.info("KinetixCam opened")
-
-    def close(self) -> None:
-        """Closes camera connection and performs cleanup."""
-        self.cam.Close()
-        logging.info("KinetixCam connection closed")
-
-# Other camera classes and sensors would follow here, such as GenICamPhantom, GenICamHarvester, etc.
-# Assuming that code for other classes is already available and similar in structure to KinetixCam.
-
-# Final logging setup for ease of tracking state in console:
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
