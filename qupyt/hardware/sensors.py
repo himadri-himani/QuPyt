@@ -119,6 +119,8 @@ class SensorFactory:
                 return DAQ(configuration)
             if sensor_type == "MockCam":
                 return MockCam(configuration)
+            if sensor_type == "KinetixCam":
+                return KinetixCam(configuration)
             raise ValueError(f"Requested sensor type {sensor_type} does not exists")
         except Exception as exc:
             logging.exception(
@@ -1173,3 +1175,100 @@ class MockCam(Sensor):
         """
         Passes since there is no device to close.
         """
+class KinetixCam(Sensor):
+    """
+    Sensor class for Kinetix camera.
+
+    Arguments:
+        - **configuration** (dict): Configuration dictionary with settings like
+          `exposure_time`, `image_roi`, `frames_per_trigger`, `trigger_mode`, `snapshot`.
+    """
+
+    def __init__(self, configuration: Dict[str, Any]) -> None:
+        self.cam = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        self.cam.Open()
+        super().__init__(configuration)
+        
+        # Map configuration attributes
+        self.attribute_map["exposure_time"] = self._set_exposure_time
+        self.attribute_map["image_roi"] = self._set_roi
+        self.attribute_map["frames_per_trigger"] = self._set_frames_per_trigger
+        self.attribute_map["trigger_mode"] = self._set_trigger_mode
+        self.initial_configuration_dict = configuration
+        self.roi_shape = [3200, 3200]  # Example ROI dimensions; update based on config
+        
+        # Apply configurations
+        if configuration:
+            self._update_from_configuration(configuration)
+
+    def __repr__(self) -> str:
+        return f"KinetixCam(configuration: {self.initial_configuration_dict})"
+
+    def __str__(self) -> str:
+        return f"Kinetix camera instance: KinetixCam(configuration: {self.initial_configuration_dict})"
+
+    def _set_exposure_time(self, exposure_time: int) -> None:
+        """Set camera exposure time (in ms)."""
+        self.cam.ExposureTime.SetValue(exposure_time * 1000)  # Convert ms to µs if needed
+
+    def _set_roi(self, roi: List[int]) -> None:
+        """Set Region of Interest (ROI) on the camera sensor."""
+        x, y, width, height = roi
+        self.cam.OffsetX.SetValue(x)
+        self.cam.OffsetY.SetValue(y)
+        self.cam.Width.SetValue(width)
+        self.cam.Height.SetValue(height)
+        self.roi_shape = [height, width]
+
+    def _set_frames_per_trigger(self, frames: int) -> None:
+        """Set the number of frames per trigger."""
+        self.cam.AcquisitionFrameCount.SetValue(frames)
+
+    def _set_trigger_mode(self, mode: str) -> None:
+        """Set the camera's trigger mode."""
+        self.cam.TriggerMode.SetValue(mode)
+
+    def acquire_data(self, synchroniser: Optional[Synchroniser] = None) -> np.ndarray:
+        """Acquire frames from the Kinetix camera."""
+        time_start = time()
+        self.cam.StartGrabbingMax(self.number_measurements)
+        if synchroniser:
+            synchroniser.trigger()
+        
+        frames = []
+        for _ in range(self.number_measurements):
+            grab_result = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+            if grab_result.GrabSucceeded():
+                frame = np.asarray(grab_result.Array)
+                frames.append(frame)
+                if self.initial_configuration_dict.get("snapshot"):
+                    self._save_snapshot(frame)
+            grab_result.Release()
+        
+        time_end = time()
+        logging.info(f"Kinetix data acquisition took {time_end - time_start:.2f} seconds".ljust(65, ".") + "[done]")
+        return np.array(frames)
+
+    def _save_snapshot(self, frame: np.ndarray) -> None:
+        """Save a snapshot of the frame if snapshot is enabled."""
+        import cv2
+        timestamp = int(time())
+        filename = f"kinetix_snapshot_{timestamp}.png"
+        cv2.imwrite(filename, frame)
+        logging.info(f"Snapshot saved as {filename}")
+
+    def open(self) -> None:
+        """Opens camera connection."""
+        logging.info("KinetixCam opened")
+
+    def close(self) -> None:
+        """Closes camera connection and performs cleanup."""
+        self.cam.Close()
+        logging.info("KinetixCam connection closed")
+
+# Other camera classes and sensors would follow here, such as GenICamPhantom, GenICamHarvester, etc.
+# Assuming that code for other classes is already available and similar in structure to KinetixCam.
+
+# Final logging setup for ease of tracking state in console:
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
